@@ -1,7 +1,17 @@
+import { Mutex } from 'async-mutex'
+
 import encryptionManager from './routerEncryption.mjs'
 import { TP_ACT, RouterProtocol } from './routerProtocol.mjs'
 import { httpClient, isRetryableError } from './httpClient.mjs'
 import logger from './logger.mjs'
+
+// Per-request ceiling on the locked section. The MR600 web stack is single-
+// session-stateful; if a command hangs we must not wedge the queue forever.
+const EXECUTE_TIMEOUT_MS = 10_000;
+
+// Log a warning when more than this many callers are waiting on the mutex —
+// indicates the upstream client is bursting harder than the router can serve.
+const QUEUE_DEPTH_WARN_THRESHOLD = 4;
 
 /**
  * Enables communication with mr600 router
@@ -13,6 +23,11 @@ class RouterClient {
 
   sessionId = null; // session is obtained via authentication and included in each request via cookie
   tokenId = null; // token is obtained after authenticated and included as its own http header
+
+  // Serializes execute() so concurrent callers don't corrupt the stateful
+  // session (sessionId / tokenId / encryption seq) mid-request.
+  _mutex = new Mutex();
+  _waiting = 0;
 
   constructor(url, login, password) {
     this.url = url;
@@ -165,6 +180,20 @@ class RouterClient {
   }
 
   async execute(request, allowReconnectionOnError = true) {
+    this._waiting += 1;
+    if (this._waiting >= QUEUE_DEPTH_WARN_THRESHOLD) {
+      logger.warn('router_client.queue_depth_high', { waiting: this._waiting });
+    }
+    try {
+      return await this._mutex.runExclusive(
+        () => this._executeLocked(request, allowReconnectionOnError),
+      );
+    } finally {
+      this._waiting -= 1;
+    }
+  }
+
+  async _executeLocked(request, allowReconnectionOnError) {
     // auto connect if not ready
     if (this.isReady === false) {
       await this.connect();
@@ -172,7 +201,7 @@ class RouterClient {
 
     const dataFrame = this.protocol.makeDataFrame(request);
     const encryptedPayload = this.encryptDataFrame(dataFrame);
-    
+
     const cgiUrl = this.url + "/cgi_gdpr";
     return this.httpClient.post(cgiUrl, encryptedPayload, {
       headers: {
@@ -180,7 +209,8 @@ class RouterClient {
         "Cookie": "loginErrorShow=1; JSESSIONID=" + this.sessionId,
         "TokenID": this.tokenId,
         "Content-Type": 'text/plain',
-      }
+      },
+      timeout: EXECUTE_TIMEOUT_MS,
     }).then(response => {
       const decryptedPayload = this.encryption.AESDecrypt(response.data);
       const decodedPayload = this.protocol.fromDataFrame(decryptedPayload);
@@ -190,7 +220,7 @@ class RouterClient {
       // when our token/cookie becomes invalid all our next commands give 500
       if (exception.message === 'Request failed with status code 500' && allowReconnectionOnError === true) {
         this.reset();
-        return this.execute(request, false);
+        return this._executeLocked(request, false);
       } else {
         // chain
         throw exception;
